@@ -120,6 +120,7 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", default=None, help="a directory under runs/ (default: newest)")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--open", action="store_true", help="open browser (default)")
     ap.add_argument("--no-open", action="store_true")
     a = ap.parse_args(argv)
 

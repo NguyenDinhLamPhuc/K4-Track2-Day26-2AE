@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -113,6 +113,30 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import (
+    ROUNDS_PER_DUEL,
+    BudgetPacer,
+    cheap_mask,
+    is_catalog_trap,
+    pick_replica,
+    successor_of,
+)
+
+# Collaborator files, degraded gracefully like the imports above.
+try:
+    from kit.mcp.specs import TOOL_SPECS, cost as _spec_cost
+    _SPECS_AVAILABLE = True
+except ImportError:  # pragma: no cover - collaborator file
+    TOOL_SPECS = {}
+    _SPECS_AVAILABLE = False
+
+    def _spec_cost(server: str, tool: str, fields: tuple[str, ...] = (), n_rows: int = 1) -> int:
+        raise KeyError("kit.mcp.specs unavailable")
+
+try:
+    from kit.mcp.a2a import verify_delegation as _verify_delegation
+except ImportError:  # pragma: no cover - collaborator file
+    _verify_delegation = None
 
 __all__ = [
     "COMMAND_KINDS",
@@ -350,6 +374,12 @@ class Gateway:
         # Command ids you have already denied, in case a later job wants to
         # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        # ROUTE: replica pinned per path for the whole duel, and the paths
+        # on which a flip was attempted (fed to strategy.pick_replica).
+        self._pinned_replica: dict[str, str] = {}
+        self._drifting_paths: set[str] = set()
+        # AUTHORIZE: delegation token ids already used (replay defence).
+        self._seen_tokens: set[str] = set()
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -367,63 +397,275 @@ class Gateway:
         currently changes the outcome."""
         self._telemetry.decision_seen(cmd)
 
-        # ------------------------------------------------------------------
-        # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # decide() must never raise (a raise = deny + 2 cr + a free
+        # enforcement_failure for the prosecutor), so an unexpected internal
+        # error becomes a defensible, free deny instead.
+        try:
+            return self._decide(cmd)
+        except Exception as exc:  # noqa: BLE001 - fail closed, never raise
+            return self.deny(cmd, f"gateway internal error, failing closed: {type(exc).__name__}")
 
-        # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+    def _decide(self, cmd: Command) -> Decision:
+        # JOB 1 — ROUTE: pin the replica instead of trusting the model / a
+        # swap_replica mutation (anti stale_read).
+        routed, route_note = self._route(cmd)
 
-        # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # JOB 2 — ADMIT: free denials for calls certain to fail
+        # (anti protocol_misuse / wasteful).
+        reason = self._admit(routed)
+        if reason:
+            return self.deny(cmd, reason)
 
-        # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # JOB 3 — AUTHORIZE: act / scopes / audience / signed delegation
+        # (anti authority_exceeded).
+        reason = self._authorize(routed)
+        if reason:
+            return self.deny(cmd, reason)
 
-        call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        # JOB 4 — BUDGET: cut expensive masks, deny what cannot be afforded
+        # (anti wasteful).
+        routed, budget_note, reason = self._budget(routed)
+        if reason:
+            return self.deny(cmd, reason)
+
+        notes = [n for n in (route_note, budget_note) if n]
+        changed = (
+            routed.headers != cmd.headers
+            or routed.fields != cmd.fields
+            or routed.args != cmd.args
+        )
+        decision = Decision(
+            verdict="rewrite" if changed else "forward",
+            call=self._to_tool_call(routed),
+            note="; ".join(notes) or None,
+        )
         self._telemetry.decision_made(cmd, decision)
         return decision
+
+    # -- shared helpers -------------------------------------------------
+    @staticmethod
+    def _header(headers: Mapping[str, Any], name: str) -> Any:
+        """Case-insensitive header read (never let capitalisation hide one)."""
+        for k, v in headers.items():
+            if isinstance(k, str) and k.lower() == name:
+                return v
+        return None
+
+    @staticmethod
+    def _norm_learner(value: Any) -> str | None:
+        """`Learner:sv-0417` (anchor form) and `learner:sv-0417` (act form)
+        name the same principal."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        v = value.strip()
+        if ":" not in v:
+            return f"learner:{v}"
+        kind, _, name = v.partition(":")
+        return f"{kind.lower()}:{name}"
+
+    @staticmethod
+    def _path_id(args: Mapping[str, Any]) -> str:
+        anchor = args.get("anchor") or args.get("learner") or ""
+        if isinstance(anchor, str) and ":" in anchor:
+            return anchor.split(":", 1)[1].split("/", 1)[0]
+        return anchor if isinstance(anchor, str) and anchor else "*"
+
+    @staticmethod
+    def _spec(cmd: Command):
+        return TOOL_SPECS.get((cmd.server, cmd.tool)) if _SPECS_AVAILABLE else None
+
+    def _is_write(self, cmd: Command) -> bool:
+        spec = self._spec(cmd)
+        if spec is not None:
+            return spec.is_write
+        return cmd.tool in {"record_mastery", "flag_stale_slide", "file_content_bug"}
+
+    @staticmethod
+    def _g(obj: Any, key: str) -> Any:
+        return obj.get(key) if isinstance(obj, Mapping) else getattr(obj, key, None)
+
+    # -- JOB 1: ROUTE ---------------------------------------------------
+    def _route(self, cmd: Command) -> tuple[Command, str | None]:
+        """Pin ONE replica per path for the whole duel. A later command that
+        asks for a different one (swap_replica / replica_flip, or a route
+        smuggled into args) is rewritten back to the pinned replica."""
+        if cmd.kind != "mcp" or self._is_write(cmd):
+            return cmd, None
+
+        headers = dict(cmd.headers)
+        args = dict(cmd.args)
+        path = self._path_id(args)
+
+        asked = self._header(headers, "mcp-replica")
+        smuggled = args.pop("route", None)
+        smuggled = args.pop("replica", smuggled)
+        alias = {"canonical": "c", "working": "w"}
+        wanted = [alias.get(str(r).lower(), str(r).lower()) for r in (asked, smuggled) if r]
+
+        pinned = self._pinned_replica.get(path)
+        if pinned is None:
+            if asked and not smuggled:
+                pinned = wanted[0]  # first, header-borne choice is honoured
+            else:
+                pinned = pick_replica(
+                    path_id=path, known_drifting=path in self._drifting_paths
+                ).replica
+            self._pinned_replica[path] = pinned
+
+        flipped = any(r != pinned for r in wanted)
+        if flipped:
+            self._drifting_paths.add(path)
+
+        for k in [k for k in headers if isinstance(k, str) and k.lower() == "mcp-replica"]:
+            del headers[k]
+        headers["mcp-replica"] = pinned
+
+        note = f"route: replica {pinned!r} for {path!r}" + (" (rejected a replica flip)" if flipped else "")
+        return replace(cmd, headers=headers, args=args), note
+
+    # -- JOB 2: ADMIT ---------------------------------------------------
+    def _admit(self, cmd: Command) -> str | None:
+        """A deny reason for calls known to fail (denying costs 0 cr), else None."""
+        spec = self._spec(cmd)
+
+        needs_lease = spec.needs_lease if spec is not None else cmd.tool == "get_frame"
+        if needs_lease:
+            if not cmd.lease_id:
+                return "get_frame without a lease_id is certain to fail (protocol_misuse)"
+            if cmd.lease_id not in tuple(self.ctx.leases):
+                return f"lease {cmd.lease_id!r} is not live in ctx.leases (expired or never minted)"
+
+        successor = successor_of(cmd.server, cmd.tool)
+        if successor is not None:
+            return f"{cmd.server}.{cmd.tool} is deprecated; use {successor[0]}.{successor[1]}"
+
+        if self._is_write(cmd):
+            if not self._header(cmd.headers, "if-match") or not self._header(cmd.headers, "idempotency-key"):
+                return "write is missing If-Match and/or Idempotency-Key; it cannot succeed"
+            if self._write_signature(cmd) in self._conflicted_writes():
+                return "this write already returned conflict with the same If-Match; re-read the etag first"
+        return None
+
+    def _write_signature(self, cmd: Any) -> tuple:
+        args = self._g(cmd, "args") or {}
+        headers = self._g(cmd, "headers") or {}
+        return (
+            self._g(cmd, "server"),
+            self._g(cmd, "tool"),
+            args.get("anchor") or args.get("learner"),
+            self._header(headers, "if-match"),
+        )
+
+    def _conflicted_writes(self) -> set[tuple]:
+        """Signatures of writes our OWN history shows ended in `conflict`."""
+        out: set[tuple] = set()
+        for entry in tuple(self.ctx.history or ()):
+            prior = self._g(entry, "command") or self._g(entry, "cmd")
+            outcome = self._g(entry, "outcome") or self._g(entry, "result")
+            if prior is None or outcome is None:
+                continue
+            text = str(outcome).lower()
+            if "conflict" in text or "409" in text:
+                out.add(self._write_signature(prior))
+        return out
+
+    # -- JOB 3: AUTHORIZE -----------------------------------------------
+    def _authorize(self, cmd: Command) -> str | None:
+        """Authority derives from `ctx.act` — never `sub`, never the model."""
+        act = self._norm_learner(self.ctx.act)
+        scopes = frozenset(self.ctx.scopes or ())
+
+        targets: list[Any] = [
+            cmd.args.get(k) for k in ("learner", "act", "learner_id", "for") if k in cmd.args
+        ]
+        anchor = cmd.args.get("anchor")
+        if self._is_write(cmd) and isinstance(anchor, str) and anchor.lower().startswith("learner:"):
+            targets.append(anchor)
+        for t in targets:
+            if self._norm_learner(t) != act:
+                return f"target learner {t!r} is not the authenticated act {self.ctx.act!r}"
+
+        if "wiki.read" not in scopes:
+            return "ctx.scopes does not grant wiki.read"
+        if self._is_write(cmd) and f"wiki.write:{cmd.server}" not in scopes:
+            return f"write needs scope wiki.write:{cmd.server}, which ctx.scopes never granted"
+
+        fingerprint = self._header(cmd.headers, "x-server-fingerprint")
+        if fingerprint is not None and str(fingerprint).lower() in {"unvouched", "invalid", "mismatch"}:
+            return "server fingerprint is not vouched by the registry (shadow_server)"
+        card_sig = self._header(cmd.headers, "x-card-signature")
+        if card_sig is not None and str(card_sig).lower() in {"invalid", "forged"}:
+            return "Agent Card signature is invalid (forge_card)"
+
+        aud = self._header(cmd.headers, "aud")
+        if aud is not None and aud not in {cmd.server, f"a2a:{cmd.server}", f"mcp:{cmd.server}"}:
+            return f"delegation audience {aud!r} does not match called server {cmd.server!r}"
+
+        token = cmd.args.get("delegation") or self._header(cmd.headers, "x-delegation")
+        if isinstance(token, Mapping) and _verify_delegation is not None:
+            result = _verify_delegation(
+                token,
+                aud=aud or f"a2a:{cmd.server}",
+                call_index=self.ctx.call_index,
+                expected_act=self.ctx.act,
+                seen_token_ids=self._seen_tokens,
+            )
+            if not result.admitted:
+                return f"delegation rejected: {result.reason.value if result.reason else 'unknown'}"
+            self._seen_tokens.add(str(token.get("token_id", "")))
+        return None
+
+    # -- JOB 4: BUDGET --------------------------------------------------
+    # Tools whose DEFAULT mask is the expensive full dump.
+    _NARROW_MASKS: dict[tuple[str, str], tuple[str, ...]] = {
+        ("registry", "list_servers"): ("name",),
+        ("glossary", "list_terms"): ("term",),
+    }
+
+    @staticmethod
+    def _price(server: str, tool: str, fields: tuple[str, ...]) -> int | None:
+        try:
+            return _spec_cost(server, tool, fields=tuple(fields))
+        except Exception:  # unknown tool/field: let the arena price it
+            return None
+
+    def _cheap_fields(self, cmd: Command) -> tuple[str, ...]:
+        narrow = self._NARROW_MASKS.get((cmd.server, cmd.tool))
+        if narrow is not None:
+            return cheap_mask(cmd.server, cmd.tool, narrow)
+        spec = self._spec(cmd)
+        return tuple(spec.default_fields) if spec is not None else ()
+
+    def _budget(self, cmd: Command) -> tuple[Command, str | None, str | None]:
+        """Returns (command, note, deny_reason). 100 credits for ALL 10 rounds."""
+        credits = int(self.ctx.credits)
+        fields = tuple(cmd.fields)
+        note = None
+
+        # The "punishment buttons" and the `*` wildcard are never worth it.
+        if is_catalog_trap(cmd.server, cmd.tool, fields) or fields == ("*",):
+            cheap = self._cheap_fields(cmd)
+            if cheap != fields:
+                cmd = replace(cmd, fields=cheap)
+                fields = cheap
+                note = f"budget: expensive mask replaced with {cheap!r}"
+
+        price = self._price(cmd.server, cmd.tool, fields)
+        if price is None:
+            return cmd, note, None
+        if credits <= 0 or price > credits:
+            return cmd, note, f"cannot afford {price} cr with {credits} cr left"
+
+        # Pace: spread what is left evenly over the rounds still to play.
+        rounds_left = max(1, ROUNDS_PER_DUEL - int(self.ctx.round) + 1)
+        allowance = credits // rounds_left
+        if price > max(allowance, 1) and credits < BudgetPacer().starting_pool // 2:
+            cheap = self._cheap_fields(cmd)
+            cheap_price = self._price(cmd.server, cmd.tool, cheap)
+            if cheap != fields and cheap_price is not None and cheap_price < price:
+                cmd = replace(cmd, fields=cheap)
+                note = f"budget: credits thin ({credits}), mask cut to {cheap!r}"
+        return cmd, note, None
 
     def deny(self, cmd: Command, reason: str) -> Decision:
         """Not called anywhere in this starter's `decide()` — a ready-made
@@ -545,7 +787,7 @@ if __name__ == "__main__":
     for cmd in demo_commands:
         decision = gw.decide(cmd)
         print(f"  decide({cmd.server}.{cmd.tool}) -> verdict={decision.verdict!r} quarantine={decision.quarantine}")
-        assert decision.verdict == "forward"
+        assert decision.verdict in ("forward", "rewrite")
         assert decision.call is not None
         call_dict = decision.call.to_dict() if hasattr(decision.call, "to_dict") else decision.call
         assert call_dict["server"] == cmd.server
